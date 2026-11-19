@@ -27,6 +27,9 @@ enum {
     TAG_IMAGE,
     TAG_LINE,
     TAG_LINEAR_GRADIENT,
+    TAG_MESH_GRADIENT,
+    TAG_MESH_PATCH,
+    TAG_MESH_ROW,
     TAG_PATH,
     TAG_POLYGON,
     TAG_POLYLINE,
@@ -60,6 +63,7 @@ enum {
     ATTR_ID,
     ATTR_OFFSET,
     ATTR_OPACITY,
+    ATTR_PATH,
     ATTR_POINTS,
     ATTR_PRESERVE_ASPECT_RATIO,
     ATTR_R,
@@ -129,6 +133,12 @@ static int elementid(const char* data, size_t length)
         {"image", TAG_IMAGE},
         {"line", TAG_LINE},
         {"linearGradient", TAG_LINEAR_GRADIENT},
+        {"meshGradient", TAG_MESH_GRADIENT},
+        {"meshPatch", TAG_MESH_PATCH},
+        {"meshRow", TAG_MESH_ROW},
+        {"meshgradient", TAG_MESH_GRADIENT},
+        {"meshpatch", TAG_MESH_PATCH},
+        {"meshrow", TAG_MESH_ROW},
         {"path", TAG_PATH},
         {"polygon", TAG_POLYGON},
         {"polyline", TAG_POLYLINE},
@@ -166,6 +176,7 @@ static int attributeid(const char* data, size_t length)
         {"id", ATTR_ID},
         {"offset", ATTR_OFFSET},
         {"opacity", ATTR_OPACITY},
+        {"path", ATTR_PATH},
         {"points", ATTR_POINTS},
         {"preserveAspectRatio", ATTR_PRESERVE_ASPECT_RATIO},
         {"r", ATTR_R},
@@ -1542,6 +1553,7 @@ typedef struct render_state {
 
     plutovg_matrix_t matrix;
     plutovg_rect_t extents;
+    plutovg_rect_t paint_extents;
 } render_state_t;
 
 #define INVALID_RECT PLUTOVG_MAKE_RECT(0, 0, -1, -1)
@@ -1558,6 +1570,7 @@ static void render_state_begin(const element_t* element, render_state_t* state, 
     state->opacity = parent->opacity;
     state->matrix = parent->matrix;
     state->extents = INVALID_RECT;
+    state->paint_extents = INVALID_RECT;
 
     state->view_width = parent->view_width;
     state->view_height = parent->view_height;
@@ -1769,6 +1782,688 @@ static void resolve_gradient_attributes(render_context_t* context, const render_
     }
 }
 
+#define MAX_GRADIENT_DEPTH 128
+#define MAX_MESH_PATCHES 128
+#define MAX_MESH_GRID 96
+
+typedef struct {
+    plutovg_point_t points[4];
+} mesh_edge_t;
+
+typedef struct {
+    mesh_edge_t top;
+    mesh_edge_t right;
+    mesh_edge_t bottom;
+    mesh_edge_t left;
+    plutovg_color_t colors[4];
+} mesh_patch_t;
+
+typedef struct {
+    mesh_patch_t patches[MAX_MESH_PATCHES];
+    int count;
+} mesh_t;
+
+typedef struct {
+    const element_t* x;
+    const element_t* y;
+    const element_t* units;
+    const element_t* transform;
+} mesh_gradient_attributes_t;
+
+static plutovg_point_t cubic_point(const plutovg_point_t points[4], float t)
+{
+    float u = 1.f - t;
+    float b0 = u * u * u;
+    float b1 = 3.f * u * u * t;
+    float b2 = 3.f * u * t * t;
+    float b3 = t * t * t;
+    plutovg_point_t point;
+    point.x = b0 * points[0].x + b1 * points[1].x + b2 * points[2].x + b3 * points[3].x;
+    point.y = b0 * points[0].y + b1 * points[1].y + b2 * points[2].y + b3 * points[3].y;
+    return point;
+}
+
+static plutovg_point_t mesh_patch_map(const mesh_patch_t* patch, float u, float v)
+{
+    plutovg_point_t top = cubic_point(patch->top.points, u);
+    plutovg_point_t bottom = cubic_point(patch->bottom.points, u);
+    plutovg_point_t left = cubic_point(patch->left.points, v);
+    plutovg_point_t right = cubic_point(patch->right.points, v);
+    plutovg_point_t c00 = patch->top.points[0];
+    plutovg_point_t c10 = patch->top.points[3];
+    plutovg_point_t c11 = patch->bottom.points[3];
+    plutovg_point_t c01 = patch->bottom.points[0];
+    float iu = 1.f - u;
+    float iv = 1.f - v;
+    plutovg_point_t point;
+    point.x = iv * top.x + v * bottom.x + iu * left.x + u * right.x
+        - (iu * iv * c00.x + u * iv * c10.x + u * v * c11.x + iu * v * c01.x);
+    point.y = iv * top.y + v * bottom.y + iu * left.y + u * right.y
+        - (iu * iv * c00.y + u * iv * c10.y + u * v * c11.y + iu * v * c01.y);
+    return point;
+}
+
+static plutovg_color_t mesh_patch_color(const mesh_patch_t* patch, float u, float v)
+{
+    float iu = 1.f - u;
+    float iv = 1.f - v;
+    float w0 = iu * iv;
+    float w1 = u * iv;
+    float w2 = u * v;
+    float w3 = iu * v;
+    plutovg_color_t color;
+    color.r = w0 * patch->colors[0].r + w1 * patch->colors[1].r + w2 * patch->colors[2].r + w3 * patch->colors[3].r;
+    color.g = w0 * patch->colors[0].g + w1 * patch->colors[1].g + w2 * patch->colors[2].g + w3 * patch->colors[3].g;
+    color.b = w0 * patch->colors[0].b + w1 * patch->colors[1].b + w2 * patch->colors[2].b + w3 * patch->colors[3].b;
+    color.a = w0 * patch->colors[0].a + w1 * patch->colors[1].a + w2 * patch->colors[2].a + w3 * patch->colors[3].a;
+    return color;
+}
+
+static bool parse_mesh_path(const element_t* element, const plutovg_point_t* start, const plutovg_point_t* fallback_end, plutovg_point_t points[4])
+{
+    const string_t* value = find_attribute(element, ATTR_PATH, false);
+    if(value == NULL || value->length == 0)
+        return false;
+    const char* it = value->data;
+    const char* end = it + value->length;
+    skip_ws(&it, end);
+    if(it >= end)
+        return false;
+
+    const char command = *it++;
+    if(command != 'l' && command != 'L' && command != 'c' && command != 'C')
+        return false;
+    const bool relative = command == 'l' || command == 'c';
+    const bool is_line = command == 'l' || command == 'L';
+    skip_ws(&it, end);
+
+    float values[6];
+    int count = 0;
+    while(it < end) {
+        if(count > 0 && *it == ',') {
+            ++it;
+            skip_ws(&it, end);
+            if(it >= end)
+                break;
+        }
+
+        if(count >= 6 || !parse_float(&it, end, values + count))
+            return false;
+        count += 1;
+        skip_ws(&it, end);
+    }
+
+    plutovg_point_t p1;
+    plutovg_point_t p2;
+    plutovg_point_t p3;
+    if(is_line) {
+        bool has_endpoint = count == 2;
+        if(count != 2) {
+            if(count != 0 || fallback_end == NULL)
+                return false;
+            p3 = *fallback_end;
+        } else {
+            p3.x = values[0];
+            p3.y = values[1];
+        }
+
+        if(relative && has_endpoint) {
+            p3.x += start->x;
+            p3.y += start->y;
+        }
+
+        points[0] = *start;
+        points[1].x = start->x + (p3.x - start->x) / 3.f;
+        points[1].y = start->y + (p3.y - start->y) / 3.f;
+        points[2].x = start->x + (p3.x - start->x) * 2.f / 3.f;
+        points[2].y = start->y + (p3.y - start->y) * 2.f / 3.f;
+        points[3] = p3;
+        return true;
+    }
+
+    if(count == 6) {
+        p1.x = values[0];
+        p1.y = values[1];
+        p2.x = values[2];
+        p2.y = values[3];
+        p3.x = values[4];
+        p3.y = values[5];
+    } else if(count == 4 && fallback_end != NULL) {
+        p1.x = values[0];
+        p1.y = values[1];
+        p2.x = values[2];
+        p2.y = values[3];
+        p3 = *fallback_end;
+    } else {
+        return false;
+    }
+
+    if(relative) {
+        p1.x += start->x;
+        p1.y += start->y;
+        p2.x += start->x;
+        p2.y += start->y;
+        if(count == 6) {
+            p3.x += start->x;
+            p3.y += start->y;
+        }
+    }
+
+    points[0] = *start;
+    points[1] = p1;
+    points[2] = p2;
+    points[3] = p3;
+    return true;
+}
+
+static void resolve_mesh_stop_color(render_context_t* context, const element_t* element, plutovg_color_t* color, bool* has_color)
+{
+    color_t value;
+    if(parse_color(element, ATTR_STOP_COLOR, &value, false)) {
+        *color = resolve_color(context, element, &value);
+        *has_color = true;
+    }
+
+    float opacity = 1.f;
+    if(parse_number(element, ATTR_STOP_OPACITY, &opacity, true, false)) {
+        if(!*has_color) {
+            color->r = 0.f;
+            color->g = 0.f;
+            color->b = 0.f;
+            color->a = 1.f;
+            *has_color = true;
+        }
+        color->a *= opacity;
+    }
+}
+
+static bool parse_mesh_patch(render_context_t* context, const element_t* element, const plutovg_point_t* origin, int row, int col, int row_start, int previous_row_start, int previous_row_count, const mesh_t* mesh, mesh_patch_t* patch)
+{
+    const element_t* stops[4];
+    int nstops = 0;
+    for(const element_t* child = element->first_child; child; child = child->next_sibling) {
+        if(child->id == TAG_STOP) {
+            if(nstops == 4)
+                return false;
+            stops[nstops++] = child;
+        }
+    }
+    int roles[4];
+    int nroles = 0;
+    if(nstops == 4) {
+        roles[0] = 0;
+        roles[1] = 1;
+        roles[2] = 2;
+        roles[3] = 3;
+        nroles = 4;
+    } else if(nstops == 3 && row == 0) {
+        roles[0] = 0;
+        roles[1] = 1;
+        roles[2] = 2;
+        nroles = 3;
+    } else if(nstops == 3 && col == 0) {
+        roles[0] = 1;
+        roles[1] = 2;
+        roles[2] = 3;
+        nroles = 3;
+    } else if(nstops == 2) {
+        roles[0] = 1;
+        roles[1] = 2;
+        nroles = 2;
+    } else {
+        return false;
+    }
+
+    const mesh_patch_t* above = (row > 0 && col < previous_row_count) ? mesh->patches + previous_row_start + col : NULL;
+    const mesh_patch_t* left = col > 0 ? mesh->patches + row_start + col - 1 : NULL;
+
+    plutovg_point_t c00 = {0, 0};
+    plutovg_point_t c10 = {0, 0};
+    plutovg_point_t c11 = {0, 0};
+    plutovg_point_t c01 = {0, 0};
+    plutovg_color_t color00 = {0, 0, 0, 1};
+    plutovg_color_t color10 = {0, 0, 0, 1};
+    plutovg_color_t color11 = {0, 0, 0, 1};
+    plutovg_color_t color01 = {0, 0, 0, 1};
+    bool has_c00 = false;
+    bool has_c10 = false;
+    bool has_c11 = false;
+    bool has_c01 = false;
+    bool has_color00 = false;
+    bool has_color10 = false;
+    bool has_color11 = false;
+    bool has_color01 = false;
+
+    if(row == 0 && col == 0) {
+        c00 = *origin;
+        has_c00 = true;
+    } else if(row == 0 && left) {
+        c00 = left->right.points[0];
+        c01 = left->right.points[3];
+        color00 = left->colors[1];
+        color01 = left->colors[2];
+        has_c00 = true;
+        has_c01 = true;
+        has_color00 = true;
+        has_color01 = true;
+    } else if(col == 0 && above) {
+        c00 = above->bottom.points[0];
+        c10 = above->bottom.points[3];
+        color00 = above->colors[3];
+        color10 = above->colors[2];
+        has_c00 = true;
+        has_c10 = true;
+        has_color00 = true;
+        has_color10 = true;
+    } else if(above && left) {
+        c00 = above->bottom.points[0];
+        c10 = above->bottom.points[3];
+        c01 = left->right.points[3];
+        color00 = above->colors[3];
+        color10 = above->colors[2];
+        color01 = left->colors[2];
+        has_c00 = true;
+        has_c10 = true;
+        has_c01 = true;
+        has_color00 = true;
+        has_color10 = true;
+        has_color01 = true;
+    } else {
+        return false;
+    }
+
+    bool has_top = false;
+    bool has_right = false;
+    bool has_bottom = false;
+    bool has_left = false;
+
+    for(int i = 0; i < nroles; ++i) {
+        const element_t* stop = stops[i];
+        const bool last = i == nroles - 1;
+        switch(roles[i]) {
+        case 0: {
+            if(!has_c00 || !parse_mesh_path(stop, &c00, NULL, patch->top.points))
+                return false;
+            c10 = patch->top.points[3];
+            has_c10 = true;
+            has_top = true;
+            resolve_mesh_stop_color(context, stop, &color00, &has_color00);
+            break;
+        }
+        case 1: {
+            if(!has_c10 || !parse_mesh_path(stop, &c10, NULL, patch->right.points))
+                return false;
+            c11 = patch->right.points[3];
+            has_c11 = true;
+            has_right = true;
+            resolve_mesh_stop_color(context, stop, &color10, &has_color10);
+            break;
+        }
+        case 2: {
+            if(!has_c11)
+                return false;
+            mesh_edge_t edge;
+            if(!parse_mesh_path(stop, &c11, last && has_c01 ? &c01 : NULL, edge.points))
+                return false;
+            c01 = edge.points[3];
+            has_c01 = true;
+            has_bottom = true;
+            patch->bottom.points[0] = c01;
+            patch->bottom.points[1] = edge.points[2];
+            patch->bottom.points[2] = edge.points[1];
+            patch->bottom.points[3] = c11;
+            resolve_mesh_stop_color(context, stop, &color11, &has_color11);
+            break;
+        }
+        case 3: {
+            if(!has_c01)
+                return false;
+            mesh_edge_t edge;
+            if(!parse_mesh_path(stop, &c01, last && has_c00 ? &c00 : NULL, edge.points))
+                return false;
+            c00 = edge.points[3];
+            has_c00 = true;
+            has_left = true;
+            patch->left.points[0] = c00;
+            patch->left.points[1] = edge.points[2];
+            patch->left.points[2] = edge.points[1];
+            patch->left.points[3] = c01;
+            resolve_mesh_stop_color(context, stop, &color01, &has_color01);
+            break;
+        }
+        }
+    }
+
+    if(!has_top) {
+        if(above == NULL)
+            return false;
+        patch->top = above->bottom;
+        c00 = patch->top.points[0];
+        c10 = patch->top.points[3];
+        color00 = above->colors[3];
+        color10 = above->colors[2];
+        has_c00 = true;
+        has_c10 = true;
+        has_color00 = true;
+        has_color10 = true;
+    }
+
+    if(!has_left) {
+        if(left == NULL)
+            return false;
+        patch->left = left->right;
+        c00 = patch->left.points[0];
+        c01 = patch->left.points[3];
+        color00 = left->colors[1];
+        color01 = left->colors[2];
+        has_c00 = true;
+        has_c01 = true;
+        has_color00 = true;
+        has_color01 = true;
+    }
+
+    if(!has_right || !has_bottom || !has_c00 || !has_c10 || !has_c11 || !has_c01
+        || !has_color00 || !has_color10 || !has_color11 || !has_color01) {
+        return false;
+    }
+
+    patch->colors[0] = color00;
+    patch->colors[1] = color10;
+    patch->colors[2] = color11;
+    patch->colors[3] = color01;
+    return true;
+}
+
+static bool parse_mesh(render_context_t* context, const element_t* element, const plutovg_point_t* origin, mesh_t* mesh)
+{
+    int row = 0;
+    int row_start = 0;
+    int previous_row_start = 0;
+    int previous_row_count = 0;
+    int row_count = 0;
+    for(const element_t* row_element = element->first_child; row_element; row_element = row_element->next_sibling) {
+        if(row_element->id != TAG_MESH_ROW)
+            continue;
+
+        row_start = mesh->count;
+        row_count = 0;
+        int col = 0;
+        for(const element_t* patch_element = row_element->first_child; patch_element; patch_element = patch_element->next_sibling) {
+            if(patch_element->id != TAG_MESH_PATCH)
+                continue;
+            if(mesh->count >= MAX_MESH_PATCHES)
+                return false;
+            if(!parse_mesh_patch(context, patch_element, origin, row, col, row_start, previous_row_start, previous_row_count, mesh, mesh->patches + mesh->count))
+                return false;
+            mesh->count += 1;
+            row_count += 1;
+            col += 1;
+        }
+
+        if(row_count == 0)
+            return false;
+        previous_row_start = row_start;
+        previous_row_count = row_count;
+        row += 1;
+    }
+
+    return mesh->count > 0;
+}
+
+static void transform_mesh_patch(mesh_patch_t* dst, const mesh_patch_t* src, const plutovg_matrix_t* matrix)
+{
+    *dst = *src;
+    for(int i = 0; i < 4; ++i) {
+        plutovg_matrix_map_point(matrix, src->top.points + i, dst->top.points + i);
+        plutovg_matrix_map_point(matrix, src->right.points + i, dst->right.points + i);
+        plutovg_matrix_map_point(matrix, src->bottom.points + i, dst->bottom.points + i);
+        plutovg_matrix_map_point(matrix, src->left.points + i, dst->left.points + i);
+    }
+}
+
+static uint32_t mesh_color_to_pixel(const plutovg_color_t* color)
+{
+    float alpha = CLAMP(color->a, 0.f, 1.f);
+    float red = CLAMP(color->r, 0.f, 1.f) * alpha;
+    float green = CLAMP(color->g, 0.f, 1.f) * alpha;
+    float blue = CLAMP(color->b, 0.f, 1.f) * alpha;
+    uint32_t a = (uint32_t)lroundf(alpha * 255.f);
+    uint32_t r = (uint32_t)lroundf(red * 255.f);
+    uint32_t g = (uint32_t)lroundf(green * 255.f);
+    uint32_t b = (uint32_t)lroundf(blue * 255.f);
+    return (a << 24) | (r << 16) | (g << 8) | b;
+}
+
+static float triangle_edge(const plutovg_point_t* a, const plutovg_point_t* b, float x, float y)
+{
+    return (b->x - a->x) * (y - a->y) - (b->y - a->y) * (x - a->x);
+}
+
+static void rasterize_mesh_triangle(plutovg_surface_t* surface, const plutovg_point_t points[3], const plutovg_color_t colors[3])
+{
+    plutovg_point_t p[3] = {points[0], points[1], points[2]};
+    plutovg_color_t c[3] = {colors[0], colors[1], colors[2]};
+    float area = triangle_edge(p + 0, p + 1, p[2].x, p[2].y);
+    if(fabsf(area) < 1e-6f)
+        return;
+    if(area < 0.f) {
+        area = -area;
+        plutovg_point_t point = p[1];
+        plutovg_color_t color = c[1];
+        p[1] = p[2];
+        c[1] = c[2];
+        p[2] = point;
+        c[2] = color;
+    }
+
+    float minx = MIN(p[0].x, MIN(p[1].x, p[2].x));
+    float miny = MIN(p[0].y, MIN(p[1].y, p[2].y));
+    float maxx = MAX(p[0].x, MAX(p[1].x, p[2].x));
+    float maxy = MAX(p[0].y, MAX(p[1].y, p[2].y));
+    int x0 = MAX(0, (int)floorf(minx));
+    int y0 = MAX(0, (int)floorf(miny));
+    int x1 = MIN(plutovg_surface_get_width(surface), (int)ceilf(maxx));
+    int y1 = MIN(plutovg_surface_get_height(surface), (int)ceilf(maxy));
+    if(x0 >= x1 || y0 >= y1)
+        return;
+
+    uint32_t* pixels = (uint32_t*)plutovg_surface_get_data(surface);
+    int stride = plutovg_surface_get_stride(surface) / 4;
+    for(int y = y0; y < y1; ++y) {
+        for(int x = x0; x < x1; ++x) {
+            float px = x + 0.5f;
+            float py = y + 0.5f;
+            float w0 = triangle_edge(p + 1, p + 2, px, py);
+            float w1 = triangle_edge(p + 2, p + 0, px, py);
+            float w2 = triangle_edge(p + 0, p + 1, px, py);
+            if(w0 < -0.001f || w1 < -0.001f || w2 < -0.001f)
+                continue;
+            w0 /= area;
+            w1 /= area;
+            w2 /= area;
+            plutovg_color_t color;
+            color.r = w0 * c[0].r + w1 * c[1].r + w2 * c[2].r;
+            color.g = w0 * c[0].g + w1 * c[1].g + w2 * c[2].g;
+            color.b = w0 * c[0].b + w1 * c[1].b + w2 * c[2].b;
+            color.a = w0 * c[0].a + w1 * c[1].a + w2 * c[2].a;
+            pixels[y * stride + x] = mesh_color_to_pixel(&color);
+        }
+    }
+}
+
+static void rasterize_mesh_patch(plutovg_surface_t* surface, const mesh_patch_t* source, const plutovg_matrix_t* matrix)
+{
+    mesh_patch_t patch;
+    transform_mesh_patch(&patch, source, matrix);
+
+    float max_length = 0.f;
+    const mesh_edge_t* edges[] = {&patch.top, &patch.right, &patch.bottom, &patch.left};
+    for(int i = 0; i < 4; ++i) {
+        float length = 0.f;
+        for(int j = 1; j < 4; ++j) {
+            length += hypotf(edges[i]->points[j].x - edges[i]->points[j - 1].x,
+                edges[i]->points[j].y - edges[i]->points[j - 1].y);
+        }
+        max_length = MAX(max_length, length);
+    }
+
+    int grid_size = (int)ceilf(max_length / 3.f);
+    grid_size = CLAMP(grid_size, 4, MAX_MESH_GRID);
+
+    plutovg_point_t previous_points[MAX_MESH_GRID + 1];
+    plutovg_point_t current_points[MAX_MESH_GRID + 1];
+    plutovg_color_t previous_colors[MAX_MESH_GRID + 1];
+    plutovg_color_t current_colors[MAX_MESH_GRID + 1];
+
+    for(int iy = 0; iy <= grid_size; ++iy) {
+        float v = (float)iy / grid_size;
+        for(int ix = 0; ix <= grid_size; ++ix) {
+            float u = (float)ix / grid_size;
+            current_points[ix] = mesh_patch_map(&patch, u, v);
+            current_colors[ix] = mesh_patch_color(&patch, u, v);
+        }
+
+        if(iy > 0) {
+            for(int ix = 0; ix < grid_size; ++ix) {
+                plutovg_point_t quad[4] = {
+                    previous_points[ix],
+                    previous_points[ix + 1],
+                    current_points[ix + 1],
+                    current_points[ix]
+                };
+                plutovg_color_t colors[4] = {
+                    previous_colors[ix],
+                    previous_colors[ix + 1],
+                    current_colors[ix + 1],
+                    current_colors[ix]
+                };
+
+                plutovg_point_t triangle0[3] = {quad[0], quad[1], quad[2]};
+                plutovg_color_t triangle0_colors[3] = {colors[0], colors[1], colors[2]};
+                rasterize_mesh_triangle(surface, triangle0, triangle0_colors);
+
+                plutovg_point_t triangle1[3] = {quad[0], quad[2], quad[3]};
+                plutovg_color_t triangle1_colors[3] = {colors[0], colors[2], colors[3]};
+                rasterize_mesh_triangle(surface, triangle1, triangle1_colors);
+            }
+        }
+
+        memcpy(previous_points, current_points, sizeof(current_points));
+        memcpy(previous_colors, current_colors, sizeof(current_colors));
+    }
+}
+
+static void collect_mesh_attributes(const element_t* element, mesh_gradient_attributes_t* attributes)
+{
+    if(attributes->x == NULL && has_attribute(element, ATTR_X))
+        attributes->x = element;
+    if(attributes->y == NULL && has_attribute(element, ATTR_Y))
+        attributes->y = element;
+    if(attributes->units == NULL && has_attribute(element, ATTR_GRADIENT_UNITS))
+        attributes->units = element;
+    if(attributes->transform == NULL && has_attribute(element, ATTR_TRANSFORM))
+        attributes->transform = element;
+    if(attributes->transform == NULL && has_attribute(element, ATTR_GRADIENT_TRANSFORM))
+        attributes->transform = element;
+}
+
+static bool apply_mesh_gradient(render_state_t* state, render_context_t* context, const element_t* element)
+{
+    mesh_gradient_attributes_t attributes = {0};
+    const element_t* current = element;
+    const element_t* data = element;
+    for(int i = 0; i < MAX_GRADIENT_DEPTH; ++i) {
+        collect_mesh_attributes(current, &attributes);
+        bool has_rows = false;
+        for(const element_t* child = current->first_child; child; child = child->next_sibling) {
+            if(child->id == TAG_MESH_ROW) {
+                has_rows = true;
+                break;
+            }
+        }
+        if(has_rows)
+            data = current;
+
+        const element_t* ref = resolve_href(context->document, current);
+        if(ref == NULL || ref->id != TAG_MESH_GRADIENT)
+            break;
+        current = ref;
+    }
+
+    if(attributes.x == NULL) attributes.x = element;
+    if(attributes.y == NULL) attributes.y = element;
+    if(attributes.units == NULL) attributes.units = element;
+    if(attributes.transform == NULL) attributes.transform = element;
+
+    units_type_t units = units_type_object_bounding_box;
+    plutovg_matrix_t transform = PLUTOVG_IDENTITY_MATRIX;
+    parse_units_type(attributes.units, ATTR_GRADIENT_UNITS, &units);
+    parse_transform(attributes.transform, ATTR_TRANSFORM, &transform);
+    if(!parse_transform(attributes.transform, ATTR_TRANSFORM, &transform))
+        parse_transform(attributes.transform, ATTR_GRADIENT_TRANSFORM, &transform);
+
+    length_t x = {0, length_type_percent};
+    length_t y = {0, length_type_percent};
+    parse_length(attributes.x, ATTR_X, &x, true, false);
+    parse_length(attributes.y, ATTR_Y, &y, true, false);
+
+    plutovg_point_t origin;
+    origin.x = resolve_gradient_length(state, &x, units, 'x');
+    origin.y = resolve_gradient_length(state, &y, units, 'y');
+
+    mesh_t mesh = {0};
+    if(!parse_mesh(context, data, &origin, &mesh))
+        return false;
+    plutovg_rect_t extents = state->extents;
+    if(IS_INVALID_RECT(extents) || IS_EMPTY_RECT(extents))
+        return false;
+    plutovg_rect_t surface_extents = IS_INVALID_RECT(state->paint_extents) ? extents : state->paint_extents;
+    if(IS_EMPTY_RECT(surface_extents))
+        return false;
+
+    plutovg_matrix_t mesh_matrix = transform;
+    if(units == units_type_object_bounding_box) {
+        plutovg_matrix_t bounding_box;
+        plutovg_matrix_init_translate(&bounding_box, extents.x, extents.y);
+        plutovg_matrix_scale(&bounding_box, extents.w, extents.h);
+        plutovg_matrix_multiply(&mesh_matrix, &transform, &bounding_box);
+    }
+
+    float scale_x = hypotf(state->matrix.a, state->matrix.b);
+    float scale_y = hypotf(state->matrix.c, state->matrix.d);
+    if(scale_x <= 0.f)
+        scale_x = 1.f;
+    if(scale_y <= 0.f)
+        scale_y = 1.f;
+
+    int width = (int)ceilf(surface_extents.w * scale_x);
+    int height = (int)ceilf(surface_extents.h * scale_y);
+    if(width <= 0 || height <= 0)
+        return false;
+    width = CLAMP(width, 1, 2048);
+    height = CLAMP(height, 1, 2048);
+
+    plutovg_surface_t* surface = plutovg_surface_create(width, height);
+    if(surface == NULL)
+        return false;
+
+    plutovg_matrix_t user_to_surface;
+    plutovg_matrix_init_scale(&user_to_surface, (float)width / surface_extents.w, (float)height / surface_extents.h);
+    plutovg_matrix_translate(&user_to_surface, -surface_extents.x, -surface_extents.y);
+
+    plutovg_matrix_t mesh_to_surface;
+    plutovg_matrix_multiply(&mesh_to_surface, &mesh_matrix, &user_to_surface);
+    for(int i = 0; i < mesh.count; ++i) {
+        rasterize_mesh_patch(surface, mesh.patches + i, &mesh_to_surface);
+    }
+    plutovg_matrix_t texture_matrix;
+    plutovg_matrix_init_translate(&texture_matrix, surface_extents.x, surface_extents.y);
+    plutovg_matrix_scale(&texture_matrix, surface_extents.w / width, surface_extents.h / height);
+    plutovg_canvas_set_texture(context->canvas, surface, PLUTOVG_TEXTURE_TYPE_PLAIN, 1.f, &texture_matrix);
+    plutovg_surface_destroy(surface);
+    return true;
+}
+
 typedef struct {
     gradient_attributes_t base;
     const element_t* x1;
@@ -1776,8 +2471,6 @@ typedef struct {
     const element_t* x2;
     const element_t* y2;
 } linear_gradient_attributes_t;
-
-#define MAX_GRADIENT_DEPTH 128
 
 static bool apply_linear_gradient(render_state_t* state, render_context_t* context, const element_t* element)
 {
@@ -1947,6 +2640,8 @@ static bool apply_paint(render_state_t* state, render_context_t* context, const 
         return apply_linear_gradient(state, context, ref);
     if(ref->id == TAG_RADIAL_GRADIENT)
         return apply_radial_gradient(state, context, ref);
+    if(ref->id == TAG_MESH_GRADIENT)
+        return apply_mesh_gradient(state, context, ref);
     return false;
 }
 
@@ -1967,9 +2662,8 @@ static void draw_shape(const element_t* element, render_context_t* context, rend
         parse_number(element, ATTR_STROKE_MITERLIMIT, &miter_limit, false, true);
     }
 
-    if(state->mode == render_mode_bounding) {
-        if(stroke.type == paint_type_none)
-            return;
+    float stroke_delta = 0.f;
+    if(stroke.type > paint_type_none) {
         float line_width = resolve_length(state, &stroke_width, 'o');
         float cap_limit = line_width / 2.f;
         if(line_cap == PLUTOVG_LINE_CAP_SQUARE)
@@ -1979,17 +2673,23 @@ static void draw_shape(const element_t* element, render_context_t* context, rend
             join_limit *= miter_limit;
         }
 
-        float delta = MAX(cap_limit, join_limit);
-        state->extents.x -= delta;
-        state->extents.y -= delta;
-        state->extents.w += delta * 2.f;
-        state->extents.h += delta * 2.f;
+        stroke_delta = MAX(cap_limit, join_limit);
+    }
+
+    if(state->mode == render_mode_bounding) {
+        if(stroke.type == paint_type_none)
+            return;
+        state->extents.x -= stroke_delta;
+        state->extents.y -= stroke_delta;
+        state->extents.w += stroke_delta * 2.f;
+        state->extents.h += stroke_delta * 2.f;
         return;
     }
 
     paint_t fill = {paint_type_color, {color_type_fixed, 0xFF000000}};
     parse_paint(element, ATTR_FILL, &fill);
 
+    state->paint_extents = state->extents;
     if(apply_paint(state, context, &fill)) {
         float fill_opacity = 1.f;
         parse_number(element, ATTR_FILL_OPACITY, &fill_opacity, true, true);
@@ -2003,6 +2703,11 @@ static void draw_shape(const element_t* element, render_context_t* context, rend
         plutovg_canvas_fill_path(context->canvas, context->document->path);
     }
 
+    state->paint_extents = state->extents;
+    state->paint_extents.x -= stroke_delta;
+    state->paint_extents.y -= stroke_delta;
+    state->paint_extents.w += stroke_delta * 2.f;
+    state->paint_extents.h += stroke_delta * 2.f;
     if(apply_paint(state, context, &stroke)) {
         float stroke_opacity = 1.f;
         parse_number(element, ATTR_STROKE_OPACITY, &stroke_opacity, true, true);
@@ -2590,6 +3295,7 @@ bool plutosvg_document_render(const plutosvg_document_t* document, const char* i
     state.mode = render_mode_painting;
     state.opacity = 1.f;
     state.extents = INVALID_RECT;
+    state.paint_extents = INVALID_RECT;
     state.view_width = document->width;
     state.view_height = document->height;
     plutovg_canvas_get_matrix(canvas, &state.matrix);
@@ -2657,6 +3363,7 @@ bool plutosvg_document_extents(const plutosvg_document_t* document, const char* 
     state.mode = render_mode_bounding;
     state.opacity = 1.f;
     state.extents = INVALID_RECT;
+    state.paint_extents = INVALID_RECT;
     state.view_width = document->width;
     state.view_height = document->height;
     plutovg_matrix_init_identity(&state.matrix);

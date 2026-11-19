@@ -1,7 +1,7 @@
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
-FILE(COPY camera.svg DESTINATION "${CMAKE_BINARY_DIR}/examples")
+FILE(COPY camera.svg mesh-gradient.svg mesh-gradient-bbox.svg mesh-icon.svg DESTINATION "${CMAKE_BINARY_DIR}/examples")
 
 add_executable(camera2png camera2png.c)
 target_link_libraries(camera2png plutosvg)

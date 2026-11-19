@@ -1,0 +1,17 @@
+{
+  "root": "/home/dev/feedback/uid26334",
+  "B": "/home/dev/feedback/uid26334",
+  "sha": "82491d7f12b03b3151c4347ebef7c19ff10969a4",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "sammycage",
+    "repo": "plutosvg",
+    "sha": "82491d7f12b03b3151c4347ebef7c19ff10969a4"
+  },
+  "fork": {
+    "owner": "Rrr119",
+    "repo": "plutosvg",
+    "cloneUrl": "https://github.com/Rrr119/plutosvg.git"
+  },
+  "at": "2026-11-18T23:36:01.324Z"
+}

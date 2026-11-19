@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <meshgradient id="mesh" x="0" y="0" gradientUnits="userSpaceOnUse">
+      <meshrow>
+        <meshpatch>
+          <stop path="c 64,-32 192,-32 256,0" stop-color="#2563eb"/>
+          <stop path="c 32,64 32,192 0,256" stop-color="#9333ea"/>
+          <stop path="c -64,32 -192,32 -256,0" stop-color="#db2777"/>
+          <stop path="c -32,-64 -32,-192 0,-256" stop-color="#0d9488"/>
+        </meshpatch>
+      </meshrow>
+    </meshgradient>
+  </defs>
+  <rect x="16" y="16" width="224" height="224" rx="52" fill="#1e293b"/>
+  <rect x="16" y="16" width="224" height="224" rx="52" fill="url(#mesh)"/>
+  <path d="M126 88 L162 180 L142 180 L136 160 L100 160 L94 180 L74 180 L110 88 Z
+           M118 122 L107 145 L129 145 Z"
+        fill="#f8fafc" fill-rule="evenodd"/>
+</svg>

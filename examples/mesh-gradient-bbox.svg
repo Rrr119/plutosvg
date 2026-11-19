@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <meshgradient id="mesh" x="0" y="0" gradientUnits="objectBoundingBox">
+      <meshrow>
+        <meshpatch>
+          <stop path="c 0.25,-0.15 0.75,-0.15 1,0" stop-color="#2563eb"/>
+          <stop path="c 0.15,0.25 0.15,0.75 0,1" stop-color="#c026d3"/>
+          <stop path="c -0.25,0.15 -0.75,0.15 -1,0" stop-color="#ec4899"/>
+          <stop path="c -0.15,-0.25 -0.15,-0.75 0,-1" stop-color="#14b8a6"/>
+        </meshpatch>
+      </meshrow>
+    </meshgradient>
+  </defs>
+  <rect x="28" y="68" width="200" height="120" rx="28" fill="url(#mesh)"/>
+</svg>

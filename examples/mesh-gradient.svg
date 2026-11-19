@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <meshgradient id="mesh" x="0" y="0" gradientUnits="userSpaceOnUse">
+      <meshrow>
+        <meshpatch>
+          <stop path="l 128,0" stop-color="#ef4444"/>
+          <stop path="l 0,128" stop-color="#f59e0b"/>
+          <stop path="l -128,0" stop-color="#10b981"/>
+          <stop path="l 0,-128" stop-color="#3b82f6"/>
+        </meshpatch>
+        <meshpatch>
+          <stop path="l 128,0"/>
+          <stop path="l 0,128" stop-color="#8b5cf6"/>
+          <stop path="l -128,0" stop-color="#ec4899"/>
+        </meshpatch>
+      </meshrow>
+      <meshrow>
+        <meshpatch>
+          <stop path="l 0,128" stop-color="#14b8a6"/>
+          <stop path="l -128,0" stop-color="#84cc16"/>
+          <stop path="l 0,-128" stop-color="#eab308"/>
+        </meshpatch>
+        <meshpatch>
+          <stop path="l 0,128" stop-color="#6366f1"/>
+          <stop path="l -128,0" stop-color="#f97316"/>
+        </meshpatch>
+      </meshrow>
+    </meshgradient>
+  </defs>
+  <rect width="256" height="256" fill="url(#mesh)"/>
+</svg>

@@ -29,6 +29,29 @@ int main(void)
 
 ![camera.png](https://github.com/sammycage/plutosvg/blob/master/camera.png)
 
+## SVG 2 Mesh Gradients
+
+PlutoSVG supports SVG 2 `meshgradient` paint servers, including `meshrow`
+and `meshpatch` subsections, Coons patch paths, shared patch edges, and
+`objectBoundingBox` or `userSpaceOnUse` coordinates. Both the SVG 2
+lowercase element names and the older camelCase spellings are accepted.
+
+The example below compares the same icon rendered before and after mesh
+gradient support:
+
+| Before | After |
+| --- | --- |
+| ![mesh gradient before](artifacts/mesh-before.png) | ![mesh gradient after](artifacts/mesh-after.png) |
+
+The 2x2 shared-edge test and an `objectBoundingBox` example are available in
+`examples/mesh-gradient.svg` and `examples/mesh-gradient-bbox.svg`. Render
+them with:
+
+```bash
+./build/examples/svg2png examples/mesh-gradient.svg mesh-grid.png
+./build/examples/svg2png examples/mesh-gradient-bbox.svg mesh-bbox.png
+```
+
 ## Integrating with FreeType
 
 ```c
